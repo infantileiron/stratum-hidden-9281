@@ -32,7 +32,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 2. 09:05 检查每孔输入顺序和1米间距；重复、缺层、倒序不自动拼接。
 3. 09:10 核查三态均值45/70/98、方差16/25/16、初始和转移，人工命名为低/中/高响应态。
 4. 09:15 选择SX-01整个160点孔段，锁定模型修订、读数、概率与名称快照，保存SHA256。
-5. 09:20 提交Redis，独立Python worker运行对数域前向后向与Viterbi回溯，结果落PostgreSQL和共享JSON。
+5. 09:20 提交Redis，独立Python worker运行对数域前向后向与Viterbi回溯，结果落PostgreSQL和共享JSON。执行进程若中断，租约过期后在同一运行上恢复，复用原孔段与模型快照。
 6. 09:25 沿深度查看读数、三态后验、点态argmax与整条MAP，核查对数分数与回溯前驱。
 7. 09:30 模型后来修订为v2时，旧研究和报告仍引用v1，分析员提交地学复核。
 8. 09:40 编辑批准后下载CSV，保留孔段、旧模型名称/概率/参数、点态后验、路径与回溯。
@@ -59,6 +59,14 @@ CSV列borehole,depth_m,value，truth可选且仅作模拟参考。孔ID为1—30
 
 总MAP分数是路径与连续观测的联合对数密度，不是离散概率。返回log_joint_density；兼容键log_probability表示同一联合对数密度。整路径后验log P(path|观测)通过相对MAP分数减相对观测log密度得到，先抵消公共Gaussian offset，避免两个巨大数相减。UI和CSV明确区分这三种量，未将低似然指数化。
 
+## 中断恢复、重复投递与有效结果
+
+运行以租约（`RUN_LEASE_SECONDS`，默认180秒）和一次性执行者令牌 `executor` 兜底。`queued`/`running` 超过租约即视为执行进程中断：页面显示“可恢复”，`POST /runs/{id}/retry` 或对同一研究重新发起会**在原运行上**重置为 `queued` 并重新投递，不新建运行；`study_id` 与其孔段/模型快照、校验和完全不变。worker 每 `RECOVERY_INTERVAL_SECONDS` 扫描过期租约自动重投，并用 Redis `SET NX` 去重。
+
+worker 出队后先以 `SELECT … FOR UPDATE`（SQLite 为 `BEGIN IMMEDIATE`）原子抢占并递增 `attempt`；同一运行被重复投递或并发争抢时只有一个执行者能进入 `running`。结果写入再校验 `executor` 与 `attempt`，且仅在 `running` 时生效：被回收的执行者、晚到的旧令牌与已完成后的重复投递一律忽略，因此恢复出的结果不会被覆盖，有效结果只有一份。
+
+已完成或已提审（`pending`/`approved`）的运行保持不变：`create` 复用现有运行，`retry` 返回409。复核与报告在锁内校验运行仍为同一 `completed` 结果，报告CSV固定该校验和；被退回的复核不阻止恢复。
+
 ## 版本、快照与报告
 
 StateModel修订PATCH递增revision；研究保存完整孔段读数、truth参考、状态ID/人工名称/参数/初始/转移/修订号及源文件的规范JSON SHA256。worker仅读研究快照，后续模型编辑或数据集改名不改旧结果。报告固定引用批准运行及其旧版本；CSV含模型参数、转移、后验、点态/路径、模拟参考与回溯前驱。未批准生成被拒绝，重复决定409。
@@ -80,7 +88,7 @@ Seed固定2409，3孔各160点，配置三态均值/方差与持久转移，含�
 
 枚举：backend/src/constants/enums.py(Role/RunStatus/ReviewStatus)、domain.py(步长/配额/假设)；frontend/src/constants/enums.ts(角色/状态)。通用共享PageTitle/Notice/StatusBadge，业务共享轨迹/模型矩阵，hooks/useResource/useSession、utils/chart/format。
 
-限制：固定一维高斯和齐次转移假设，不拟合参数，模型失配会造成误导。只处理完整1米孔段，不跨孔、不补缺层；后验是给定模型条件概率，不等于真实岩性确认。浮点极端近同发射仍有有限精度；公共offset和相对分数单独保留。Redis出队强杀不自动重投，JSON载荷无多人乐观锁/迁移回滚。所有真实测试、日志和截图仅在批次test-artifacts/gb-2409。
+限制：固定一维高斯和齐次转移假设，不拟合参数，模型失配会造成误导。只处理完整1米孔段，不跨孔、不补缺层；后验是给定模型条件概率，不等于真实岩性确认。浮点极端近同发射仍有有限精度；公共offset和相对分数单独保留。恢复以租约判定为准，进程被强杀后需等待租约过期（默认180秒）才会恢复；JSON载荷无迁移回滚。所有真实测试、日志和截图仅在批次test-artifacts/gb-2409。
 
 ## License
 
